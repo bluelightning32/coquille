@@ -87,9 +87,13 @@ def parse_value(xml):
         return ''.join(xml.itertext())
 
 def parse_error(xml):
+    print(xml)
     loc_s = xml.get('loc_s')
     loc_e = xml.get('loc_e')
-    return Err('Err: ' + loc_s + ' to ' + loc_e, int(loc_s), int(loc_e))
+    if loc_s is not None:
+        return Err('Err: ' + loc_s + ' to ' + loc_e, int(loc_s), int(loc_e))
+    else:
+        return Err('Err: invalid', None, None)
 
 def build(tag, val=None, children=()):
     attribs = {'val': val} if val is not None else {}
