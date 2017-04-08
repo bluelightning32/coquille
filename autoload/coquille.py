@@ -78,7 +78,7 @@ def coq_rewind(steps=1):
     if isinstance(response, CT.Ok):
         encountered_dots = encountered_dots[:len(encountered_dots) - steps]
     else:
-        info_msg = "[COQUILLE ERROR] Unexpected answer:\n\n%s" % response
+        info_msg = "[COQUILLE ERROR] Unexpected answer:\n\n%s" % response.err
 
     refresh()
 
@@ -154,8 +154,7 @@ def coq_raw_query(*args):
         if response.msg is not None:
             info_msg = response.msg
     elif isinstance(response, CT.Err):
-        info_msg = response.err.text
-        print("FAIL")
+        info_msg = response.err
     else:
         print("(ANOMALY) unknown answer: %s" % ET.tostring(response)) # ugly
 
@@ -198,8 +197,13 @@ def show_goal():
         print('ERROR: the Coq process died')
         return
 
-    if response.msg is not None:
-        info_msg = response.msg
+    if isinstance(response, CT.Ok):
+        if response.msg is not None:
+            info_msg = response.msg
+    elif isinstance(response, CT.Err):
+        if response.err is not None:
+            info_msg = response.err
+        return
 
     if response.val.val is None:
         buff.append('No goals.')
@@ -335,12 +339,10 @@ def send_until_fail():
         else:
             send_queue.clear()
             if isinstance(response, CT.Err):
-                response = response.err
-                info_msg = response.text
-                loc_s = response.get('loc_s')
+                info_msg = response.err
+                loc_s = response.loc_s
                 if loc_s is not None:
-                    loc_s = int(loc_s)
-                    loc_e = int(response.get('loc_e'))
+                    loc_e = response.loc_e
                     (l, c) = message_range['start']
                     (l_start, c_start) = _pos_from_offset(c, message, loc_s)
                     (l_stop, c_stop)   = _pos_from_offset(c, message, loc_e)
