@@ -32,15 +32,13 @@ branch.
 Getting started
 ---------------
 
-To launch Coquille on your Coq file, run `:CoqLaunch` which will make the
-commands :
-
+When a coq type file is loaded (anything with a .v extension), these commands become available:
+- CoqLaunch {coqtop arg} ..
+- Coq {vernacular command} ..
 - CoqNext
 - CoqToCursor
 - CoqUndo
 - CoqKill
-
-available to you.
 
 By default Coquille forces no mapping for these commands, however two sets of
 mapping are already defined and you can activate them by adding :
@@ -55,7 +53,35 @@ or
 
 to your `.vimrc`.
 
-Alternatively you can, of course, define your owns.
+Alternatively you can, of course, define your own.
+
+Starting Coq
+------------
+
+Coquille will implicitly start coqtop when any of its commands are run.
+Coquille will parse the \_CoqProject for options to pass to coqtop. This
+behavior can be disabled by setting `g:coquille_append_project_args` to 0.
+
+Additional arguments for coqtop can be specified by explicitly starting coqtop
+using `:CoqLaunch`.
+
+Multiple files
+--------------
+
+Coquille supports having multiple coq source files (.v files) open at the same
+time. The coq source files can be in separate tabs, different windows (splits)
+within the same tab, or switching between hidden buffers in the same window.
+
+When coquille is first started in a tab, it will create an info panel and a
+goals panel (split). By default if more source windows are added to the same
+tab, coquille will reuse the existing info and goals panels for the new source
+windows. Whenever the active source window is switched, the corresponding info
+and goals buffers will be displayed in their panels -- hiding the previous
+info and goals buffers.
+
+Alternatively `g:coquilled_shared` can be set to 0, which tells coquille to
+create separate info and goals panels for each coq source window. It can also
+be changed on a per window basis by setting `w:coquille_shared`.
 
 Running query commands
 ----------------------
@@ -69,8 +95,9 @@ Configuration
 
 Note that the color of the "lock zone" is hard coded and might not be pretty in
 your specific setup (depending on your terminal, colorscheme, etc).
-To change it, you can overwrite the `CheckedByCoq` and `SentToCoq` highlight
-groups (`:h hi` and `:h highlight-groups`) to colors that works better for you.
+To change it, you can overwrite the `CheckedByCoq`, `SentToCoq`, `CoqError`,
+and `CoqWarning` highlight groups (`:h hi` and `:h highlight-groups`) to colors
+that works better for you.
 See [coquille.vim][5] for an example.
 
 You can set the following variable to modify Coquille's behavior:
@@ -79,7 +106,31 @@ You can set the following variable to modify Coquille's behavior:
         (default = 'false')         move your cursor to the end of the lock zone
                                     after calls to CoqNext or CoqUndo
 
-Screenshoots
+    g:coquille_shared               Set it to 0 to cause Coquille to create new
+        (default = 1)               info and goals panels for each source
+                                    window in a tab.
+
+    g:coquille_append_project_args  When set to non-zero, \_CoqProject is parsed
+        (default = 1)               for args to pass to coqtop.
+
+    g:coquille_keep_open            Set it to 1 to prevent Coquille from
+        (default = 0)               closing the info and goals panels when they
+                                    are no longer referenced by any coq source
+                                    windows. This is useful to prevent the
+                                    window layout from changing when a non-coq
+                                    source file is edited in the coq source
+                                    window and the coq source file is not
+                                    hidden.
+
+Python version
+--------------
+
+Coquille requires python 2 or python 3 support in vim. If both are available,
+Coquille will use python 3. Once Coquille uses python 3, that prevents the vim
+from using python 2 in any other plugins. You can force Coquille to use python
+2 by putting `:call has('python')` in your `.vimrc`.
+
+Screenshots
 ------------
 
 Because pictures are always the best sellers :
@@ -90,4 +141,4 @@ Because pictures are always the best sellers :
 [2]: https://github.com/def-lkb/vimbufsync
 [3]: http://www.vim.org/scripts/script.php?script_id=2063 "coq syntax on vim.org"
 [4]: http://www.vim.org/scripts/script.php?script_id=2079 "coq indent on vim.org"
-[5]: https://github.com/the-lambda-church/coquille/blob/master/autoload/coquille.vim#L103
+[5]: https://github.com/the-lambda-church/coquille/blob/master/autoload/coquille.vim#L813
