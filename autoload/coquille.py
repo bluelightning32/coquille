@@ -111,7 +111,8 @@ class BufferState(object):
                 self._reset()
         else:
             (line, col) = self.saved_sync.pos()
-            self.rewind_to(line - 1, col) # vim indexes from lines 1, coquille from 0
+            # vim indexes from lines 1, coquille from 0
+            self.rewind_to(line - 1, col - 1)
         self.saved_sync = curr_sync
 
     def _reset(self):
@@ -173,7 +174,9 @@ class BufferState(object):
                              else self.coq_top.states[-1].end)
 
         if cline < line or (cline == line and ccol < col):
-            self.rewind_to(cline - 1, ccol)
+            # Add 1 to the column to leave whatever is at the
+            # cursor as sent.
+            self.rewind_to(cline - 1, ccol + 1)
         else:
             while True:
                 r = self._get_message_range((line, col))
@@ -422,10 +425,21 @@ class BufferState(object):
                     self.source_buffer.number)
 
     def rewind_to(self, line, col):
+        """ Go backwards to the specified position
+
+        line and col are 0-based and point to the first position to
+        remove from the sent region.
+        """
         if self.coq_top.coqtop is None:
             print('Internal error: vimbufsync is still being called but coqtop\
                     appears to be down.')
             print('Please report.')
+            return
+
+        if self.coq_top.states and self.coq_top.states[-1].end <= (line, col):
+            # The caller asked to rewind to a position after what has been
+            # processed. This quick path exits without having to search the
+            # state list.
             return
 
         predicate = lambda x: x.end <= (line, col)

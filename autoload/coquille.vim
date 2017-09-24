@@ -213,14 +213,16 @@ function! coquille#OpenSupportingBuffers(bufid, ...)
         call setbufvar(a:bufid, "errors", -1)
         execute "autocmd BufUnload <buffer=" . a:bufid .
                     \ "> call coquille#DetachSupportingBuffers(". a:bufid .")"
-        " Automatically sync the buffer when entering insert mode: this is usefull
-        " when we edit the portion of the buffer which has already been sent to coq,
-        " we can then rewind to the appropriate point.
-        " It's still incomplete though, the plugin won't sync when you undo or
-        " delete some part of your buffer. So the highlighting will be wrong, but
-        " nothing really problematic will happen, as sync will be called the next
-        " time you explicitly call a command (be it 'rewind' or 'interp')
-        execute "autocmd InsertEnter <buffer=" . a:bufid .
+        " Automatically sync the buffer when the cursor moves while in insert
+        " mode. Typically this happens when the buffer is modified. Syncing
+        " the buffer is useful when we edit the portion of the buffer which
+        " has already been sent to coq, we can then rewind to the appropriate
+        " point.  It's still incomplete though, the plugin won't sync when you
+        " undo or delete some part of your buffer. So the highlighting will be
+        " wrong, but nothing really problematic will happen, as sync will be
+        " called the next time you explicitly call a command (be it 'rewind'
+        " or 'interp')
+        execute "autocmd CursorMovedI <buffer=" . a:bufid .
                     \ "> call coquille#Python('"
                     \ "coquille.BufferState.lookup_bufid(".
                     \ a:bufid . ").sync()')"
