@@ -264,10 +264,10 @@ class BufferState(object):
         # trigger it to start processing all the commands that have been added.
         # So show_goal needs to be called before waiting for all the unchecked
         # commands finished.
-        self.show_goal(update)
-        while self.coq_top.has_unchecked_commands():
-            self.coq_top.process_response()
-            update()
+        if self.show_goal(update):
+            while self.coq_top.has_unchecked_commands():
+                self.coq_top.process_response()
+                update()
         update()
 
     def show_goal(self, feedback_callback):
@@ -282,14 +282,14 @@ class BufferState(object):
             if response is None:
                 vim.command("call coquille#KillSession()")
                 print('ERROR: the Coq process died')
-                return
+                return False
 
             if isinstance(response, CT.Err):
-                return
+                return False
 
             if response.val.val is None:
                 self.goal_buffer[0] = 'No goals.'
-                return
+                return True
 
             goals = response.val.val
 
@@ -316,6 +316,7 @@ class BufferState(object):
                 self.goal_buffer.append('')
         finally:
             self.goal_buffer.options["modifiable"] = modifiable
+        return True
 
     def show_info(self, message):
         # Temporarily make the info buffer modifiable

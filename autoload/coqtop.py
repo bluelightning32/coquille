@@ -463,6 +463,11 @@ class CoqTop(object):
         vp = self.call('Goal', (), feedback_callback=feedback_callback)
         if isinstance(vp, Ok):
             return vp
+        if vp.revert_state.id == 0:
+            if vp.err not in self.error_messages:
+                self.error_messages.append(vp.err)
+            # Can't revert to state 0 (which is before the Init)
+            return vp
         # An error occurred. Revert back to the state coqtop requested, and ask
         # for the goal again.
         revert_count = 0
