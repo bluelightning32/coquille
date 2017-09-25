@@ -170,19 +170,20 @@ class BufferState(object):
         self.sync()
 
         (cline, ccol) = vim.current.window.cursor
+        cline -= 1
         (line, col) = ((0,0) if not self.coq_top.states
                              else self.coq_top.states[-1].end)
 
         if cline < line or (cline == line and ccol < col):
             # Add 1 to the column to leave whatever is at the
             # cursor as sent.
-            self.rewind_to(cline - 1, ccol + 1)
+            self.rewind_to(cline, ccol + 1)
         else:
             while True:
                 r = self._get_message_range((line, col))
-                if r is not None and r['stop'] <= (cline - 1, ccol):
+                if r is not None and r['stop'] <= (cline, ccol + 1):
                     line = r['stop'][0]
-                    col  = r['stop'][1] + 1
+                    col  = r['stop'][1]
                     self.send_queue.append(r)
                 else:
                     break
@@ -464,11 +465,12 @@ class BufferState(object):
 
         while len(self.send_queue) > 0:
             message_range = self.send_queue.popleft()
-            message = self._between(message_range['start'], message_range['stop'])
-
             (eline, ecol) = message_range['stop']
+            message = self._between(message_range['start'],
+                                    (eline, ecol - 1))
+
             response = self.coq_top.advance(message,
-                                            (eline, ecol + 1), encoding)
+                                            (eline, ecol), encoding)
 
             if response is None:
                 vim.command("call coquille#KillSession()")
@@ -520,6 +522,14 @@ class BufferState(object):
         end_pos = self._find_next_chunk(line, col)
         return { 'start':after , 'stop':end_pos } if end_pos is not None else None
 
+    # A bullet is:
+    # - One or more '-'
+    # - One or more '+'
+    # - One or more '*'
+    # - Exactly 1 '{' (additional ones are parsed as separate statements)
+    # - Exactly 1 '}' (additional ones are parsed as separate statements)
+    bullets = re.compile("-+|\++|\*+|{|}")
+
     def _find_next_chunk(self, line, col):
         """
         Returns the position of the next chunk dot after a certain position.
@@ -527,7 +537,6 @@ class BufferState(object):
         by a dot (outside of a comment, and not denoting a path).
         """
         blen = len(self.source_buffer)
-        bullets = ['{', '}', '-', '+', '*']
         # We start by striping all whitespaces (including \n) from the beginning of
         # the chunk.
         while line < blen and self.source_buffer[line][col:].strip() == '':
@@ -546,8 +555,9 @@ class BufferState(object):
         #      might not have been sent/detected yet).
         #   2/ The bullet chars can never be used at the *beginning* of a chunk
         #      outside of a proof. So the check was unecessary.
-        if self.source_buffer[line][col] in bullets:
-            return (line, col + 1)
+        bullet_match = self.bullets.match(self.source_buffer[line], col)
+        if bullet_match:
+            return (line, bullet_match.end())
 
         # We might have a commentary before the bullet, we should be skiping it and
         # keep on looking.
@@ -561,7 +571,12 @@ class BufferState(object):
 
 
         # If the chunk doesn't start with a bullet, we look for a dot.
-        return self._find_dot_after(line, col)
+        dot = self._find_dot_after(line, col)
+        if dot:
+            # Return the position one after the dot
+            return (dot[0], dot[1] + 1)
+        else:
+            return None
 
     def _find_dot_after(self, line, col):
         """
