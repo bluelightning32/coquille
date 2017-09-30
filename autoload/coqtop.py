@@ -12,7 +12,10 @@ import sys
 from collections import deque, namedtuple
 
 # Define unicode in python 3
-unicode = getattr(__builtins__, 'unicode', str)
+if isinstance(__builtins__, dict):
+    unicode = __builtins__.get('unicode', str)
+else:
+    unicode = getattr(__builtins__, 'unicode', str)
 
 Ok = namedtuple('Ok', ['val', 'msg'])
 Err = namedtuple('Err', ['err', 'revert_state', 'loc_s', 'loc_e'])
@@ -166,10 +169,14 @@ def ignore_sigint():
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
 def escape(cmd):
-    return cmd.replace("&nbsp;", ' ') \
+    escaped = cmd.replace("&nbsp;", ' ') \
               .replace("&apos;", '\'') \
               .replace("&#40;", '(') \
               .replace("&#41;", ')')
+    if isinstance(escaped, str):
+        return escaped
+    else:
+        return escaped.encode('ascii', 'xmlcharrefreplace')
 
 class Command(object):
     # Command was sent to coqtop through an Add call, and coq acknowledged the
@@ -194,9 +201,10 @@ class Command(object):
         Command.next_edit -= 1
         self.state_id = None
         self.state = self.SENT
-        # A (line, col) pair. Both the line and col are 0-indexed. The end
+        # A (line, col, byte) pair. line, col, and byte are 0-indexed. The end
         # position is one column after the last character included in the
         # command.
+        assert(len(end) == 3)
         self.end = end
         # A byte offset relative to the start of this command where the warning
         # or error starts.
@@ -315,7 +323,7 @@ class CoqTop(object):
 
     def process_response(self):
         fd = self.coqtop.stdout.fileno()
-        data = ''
+        data = u''
         while True:
             try:
                 data += os.read(fd, 0x4000).decode("utf-8")
@@ -402,7 +410,7 @@ class CoqTop(object):
 
             r = self.call('Init', Option(None))
             assert isinstance(r, Ok)
-            comm = Command((0, 0))
+            comm = Command((0, 0, 0))
             comm.edit_id = None
             comm.state_id = r.val
             comm.state = Command.PROCESSED

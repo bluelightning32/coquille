@@ -16,7 +16,10 @@ import vimbufsync
 vimbufsync.check_version([0,1,0], who="coquille")
 
 # Define unicode in python 3
-unicode = getattr(__builtins__, 'unicode', str)
+if isinstance(__builtins__, dict):
+    unicode = __builtins__.get('unicode', str)
+else:
+    unicode = getattr(__builtins__, 'unicode', str)
 
 # Cache whether vim has a bool type
 vim_has_bool = vim.eval("exists('v:false')")
@@ -42,9 +45,10 @@ def vim_repr(value):
         return value.replace("'", "''")
     return "unknown"
 
-# Convert 0-based (line, col) pairs into 1-based lists
+# Convert 0-based (line, col, byte) tuples into 1-based lists in the form
+# [line, byte]
 def make_vim_range(start, stop):
-    return [[start[0] + 1, start[1] + 1], [stop[0] + 1, stop[1] + 1]]
+    return [[start[0] + 1, start[2] + 1], [stop[0] + 1, stop[2] + 1]]
 
 # All the python side state associated with the vim source buffer
 class BufferState(object):
@@ -171,8 +175,9 @@ class BufferState(object):
 
         (cline, ccol) = vim.current.window.cursor
         cline -= 1
-        (line, col) = ((0,0) if not self.coq_top.states
-                             else self.coq_top.states[-1].end)
+        last_sent = ((0,0,0) if not self.coq_top.states
+                     else self.coq_top.states[-1].end)
+        (line, col, byte) = last_sent
 
         if cline < line or (cline == line and ccol < col):
             # Add 1 to the column to leave whatever is at the
@@ -180,10 +185,10 @@ class BufferState(object):
             self.rewind_to(cline, ccol + 1)
         else:
             while True:
-                r = self._get_message_range((line, col))
-                if r is not None and r['stop'] <= (cline, ccol + 1):
-                    line = r['stop'][0]
-                    col  = r['stop'][1]
+                r = self._get_message_range(last_sent)
+                if (r is not None
+                    and (r['stop'][0], r['stop'][1]) <= (cline, ccol + 1)):
+                    last_sent = r['stop']
                     self.send_queue.append(r)
                 else:
                     break
@@ -197,12 +202,13 @@ class BufferState(object):
 
         self.sync()
 
-        (line, col) = ((0,0) if not self.coq_top.states
-                             else self.coq_top.states[-1].end)
-        message_range = self._get_message_range((line, col))
+        last_sent = ((0,0,0) if not self.coq_top.states
+                     else self.coq_top.states[-1].end)
+        message_range = self._get_message_range(last_sent)
 
         if message_range is None: return
 
+        assert(len(message_range['start']) == 3)
         self.send_queue.append(message_range)
 
         self.send_until_fail()
@@ -255,15 +261,14 @@ class BufferState(object):
     #####################################
 
     def refresh(self):
-        last_info = None
+        last_info = [None]
         def update():
-            nonlocal last_info
             self.reset_color()
             vim.command('redraw')
             new_info = self.coq_top.get_errors()
-            if last_info != new_info:
+            if last_info[0] != new_info:
                 self.show_info(new_info)
-                last_info = new_info
+                last_info[0] = new_info
         # It seems that coqtop needs some kind of call like Status or Goal to
         # trigger it to start processing all the commands that have been added.
         # So show_goal needs to be called before waiting for all the unchecked
@@ -353,8 +358,9 @@ class BufferState(object):
 
     def convert_offset(self, range_start, offset, range_end):
         message = self._between(range_start, range_end)
-        (line, col) = _pos_from_offset(range_start[1], message, offset)
-        return (line + range_start[0], col)
+        (line, col, byte) = _pos_from_offset(range_start[1], range_start[2],
+                                             message, offset)
+        return (line + range_start[0], col, byte)
 
     def reset_color(self):
         sent = []
@@ -437,13 +443,15 @@ class BufferState(object):
             print('Please report.')
             return
 
-        if self.coq_top.states and self.coq_top.states[-1].end <= (line, col):
+        if (self.coq_top.states and
+            (self.coq_top.states[-1].end[0],
+             self.coq_top.states[-1].end[1]) <= (line, col)):
             # The caller asked to rewind to a position after what has been
             # processed. This quick path exits without having to search the
             # state list.
             return
 
-        predicate = lambda x: x.end <= (line, col)
+        predicate = lambda x: (x.end[0], x.end[1]) <= (line, col)
         lst = filter(predicate, self.coq_top.states)
         steps = len(self.coq_top.states) - len(list(lst))
         if steps != 0:
@@ -465,12 +473,12 @@ class BufferState(object):
 
         while len(self.send_queue) > 0:
             message_range = self.send_queue.popleft()
-            (eline, ecol) = message_range['stop']
+            (eline, ecol, ebyte) = message_range['stop']
             message = self._between(message_range['start'],
-                                    (eline, ecol - 1))
+                                    (eline, ecol - 1, ebyte - 1))
 
             response = self.coq_top.advance(message,
-                                            (eline, ecol), encoding)
+                                            (eline, ecol, ebyte), encoding)
 
             if response is None:
                 vim.command("call coquille#KillSession()")
@@ -485,10 +493,15 @@ class BufferState(object):
                     loc_s = response.loc_s
                     if loc_s is not None:
                         loc_e = response.loc_e
-                        (l, c) = message_range['start']
-                        (l_start, c_start) = _pos_from_offset(c, message, loc_s)
-                        (l_stop, c_stop)   = _pos_from_offset(c, message, loc_e)
-                        self.error_at = ((l + l_start, c_start), (l + l_stop, c_stop))
+                        (l, c, b) = message_range['start']
+                        (l_start, c_start, b_start) = _pos_from_offset(c, b,
+                                                                       message,
+                                                                       loc_s)
+                        (l_stop, c_stop, b_stop)    = _pos_from_offset(c, b,
+                                                                       message,
+                                                                       loc_e)
+                        self.error_at = ((l + l_start, c_start, b_start),
+                                         (l + l_stop, c_stop, b_stop))
                 else:
                     print("(ANOMALY) unknown answer: %s" % ET.tostring(response))
                 break
@@ -502,25 +515,50 @@ class BufferState(object):
     # Miscellaneous #
     #################
 
+    # col_offset is a character offset, not byte offset
+    def _get_remaining_line(self, line, col_offset):
+        s = self.source_buffer[line]
+        if not isinstance(s, unicode):
+            s = s.decode("utf-8")
+        return s[col_offset:]
+
     def _between(self, begin, end):
         """
         Returns a string corresponding to the portion of the buffer between the
         [begin] and [end] positions.
         """
-        (bline, bcol) = begin
-        (eline, ecol) = end
+        (bline, bcol, bbyte) = begin
+        (eline, ecol, ebyte) = end
         acc = ""
         for line, str in enumerate(self.source_buffer[bline:eline + 1]):
+            if not isinstance(str, unicode):
+                str = str.decode("utf-8")
             start = bcol if line == 0 else 0
             stop  = ecol + 1 if line == eline - bline else len(str)
             acc += str[start:stop] + '\n'
         return acc
 
+    # Convert a pos from (line, col) to (line, col, byte_offset)
+    #
+    # The byte_offset is relative to the start of the line. It is the same as
+    # col, unless there are non-ascii characters.
+    #
+    # line, col, and byte_offset are all 0-indexed.
+    def _add_byte_offset(self, pos):
+        (line, col) = pos
+        s = self.source_buffer[line]
+        if not isinstance(s, unicode):
+            s = s.decode("utf-8")
+        return (line, col, len(s[:col].encode("utf-8")))
+
     def _get_message_range(self, after):
         """ See [_find_next_chunk] """
-        (line, col) = after
+        (line, col, byte) = after
         end_pos = self._find_next_chunk(line, col)
-        return { 'start':after , 'stop':end_pos } if end_pos is not None else None
+        if end_pos is None:
+            return None
+        else:
+            return { 'start':after , 'stop':self._add_byte_offset(end_pos) }
 
     # A bullet is:
     # - One or more '-'
@@ -539,14 +577,18 @@ class BufferState(object):
         blen = len(self.source_buffer)
         # We start by striping all whitespaces (including \n) from the beginning of
         # the chunk.
-        while line < blen and self.source_buffer[line][col:].strip() == '':
+        while line < blen:
+            line_val = self.source_buffer[line]
+            if not isinstance(line_val, unicode):
+                line_val = line_val.decode("utf-8")
+            while col < len(line_val) and line_val[col] in (' ', '\t'):
+                col += 1
+            if col < len(line_val) and line_val[col] not in (' ', '\t'):
+                break
             line += 1
             col = 0
 
         if line >= blen: return
-
-        while self.source_buffer[line][col] == ' ': # FIXME: keeping the stripped line would be
-            col += 1                                #   more efficient.
 
         # Then we check if the first character of the chunk is a bullet.
         # Intially I did that only when I was sure to be in a proof (by looking in
@@ -555,15 +597,15 @@ class BufferState(object):
         #      might not have been sent/detected yet).
         #   2/ The bullet chars can never be used at the *beginning* of a chunk
         #      outside of a proof. So the check was unecessary.
-        bullet_match = self.bullets.match(self.source_buffer[line], col)
+        bullet_match = self.bullets.match(line_val, col)
         if bullet_match:
             return (line, bullet_match.end())
 
         # We might have a commentary before the bullet, we should be skiping it and
         # keep on looking.
-        tail_len = len(self.source_buffer[line]) - col
-        if ((tail_len - 1 > 0) and self.source_buffer[line][col] == '('
-                and self.source_buffer[line][col + 1] == '*'):
+        tail_len = len(line_val) - col
+        if ((tail_len - 1 > 0) and line_val[col] == '('
+                and line_val[col + 1] == '*'):
             com_end = self._skip_comment(line, col + 2, 1)
             if not com_end: return
             (line, col) = com_end
@@ -585,7 +627,7 @@ class BufferState(object):
         comments, strings or ident paths are not valid.
         """
         if line >= len(self.source_buffer): return
-        s = self.source_buffer[line][col:]
+        s = self._get_remaining_line(line, col)
         dot_pos = s.find('.')
         com_pos = s.find('(*')
         str_pos = s.find('"')
@@ -610,10 +652,10 @@ class BufferState(object):
             # just after the module name.
             # Example: [Require Import Coq.Arith]
             return self._find_dot_after(line, col + dot_pos + 1)
-        elif dot_pos + col > 0 and self.source_buffer[line][col + dot_pos - 1] == '.':
+        elif dot_pos + col > 0 and self._get_remaining_line(line, col + dot_pos - 1)[0] == '.':
             # FIXME? There might be a cleaner way to express this.
             # We don't want to capture ".."
-            if dot_pos + col > 1 and self.source_buffer[line][col + dot_pos - 2] == '.':
+            if dot_pos + col > 1 and self._get_remaining_line(line, col + dot_pos - 2)[0] == '.':
                 # But we want to capture "..."
                 return (line, dot_pos + col)
             else:
@@ -630,7 +672,7 @@ class BufferState(object):
         """
         while True:
             if line >= len(self.source_buffer): return
-            s = self.source_buffer[line][col:]
+            s = self._get_remaining_line(line, col)
             str_end = s.find('"')
             if str_end > -1:
                 return (line, col + str_end + 1)
@@ -645,7 +687,7 @@ class BufferState(object):
         """
         while nb_left > 0:
             if line >= len(self.source_buffer): return None
-            s = self.source_buffer[line][col:]
+            s = self._get_remaining_line(line, col)
             com_start = s.find('(*')
             com_end = s.find('*)')
             if com_end > -1 and (com_end < com_start or com_start == -1):
@@ -662,9 +704,16 @@ class BufferState(object):
 def _empty_range():
     return [ { 'line': 0, 'col': 0}, { 'line': 0, 'col': 0} ]
 
-def _pos_from_offset(col, msg, offset):
-    str = msg[:offset]
+# Converts a byte offset into a message into a (line, col, byte) tuple
+#
+# msg is a unicode string the offset is relative to. col is the column where
+# msg starts, and byte is the byte offset where it starts.
+#
+# All indecies are 0 based.
+def _pos_from_offset(col, byte, msg, offset):
+    str = msg.encode("utf-8")[:offset].decode("utf-8")
     lst = str.split('\n')
     line = len(lst) - 1
     col = len(lst[-1]) + (col if line == 0 else 0)
-    return (line, col)
+    byte = len(lst[-1].encode("utf-8")) + (byte if line == 0 else 0)
+    return (line, col, byte)
