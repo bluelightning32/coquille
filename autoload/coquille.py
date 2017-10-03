@@ -303,21 +303,36 @@ class BufferState(object):
             goals = response.val.val
 
             sub_goals = goals.fg
+            msg_format = '{0} subgoal{1}'
+            show_hyps = True
+            if not sub_goals:
+                show_hyps = False
+                sub_goals = []
+                for (before, after) in goals.bg:
+                    sub_goals.extend(reversed(before))
+                    sub_goals.extend(after)
+                if sub_goals:
+                    msg_format = ('This subproof is complete, but there {2} {0}'
+                                  ' unfocused goal{1}')
+            if not sub_goals:
+                msg_format = 'No more subgoals.'
 
             nb_subgoals = len(sub_goals)
-            plural_opt = '' if nb_subgoals == 1 else 's'
-            self.goal_buffer[0] = '%d subgoal%s' % (nb_subgoals, plural_opt)
+            self.goal_buffer[0] = msg_format.format(nb_subgoals,
+                                                    '' if nb_subgoals == 1 else 's',
+                                                    'is' if nb_subgoals == 1 else 'are')
             self.goal_buffer.append([''])
 
             for idx, sub_goal in enumerate(sub_goals):
                 _id = sub_goal.id
                 hyps = sub_goal.hyp
                 ccl = sub_goal.ccl
-                if idx == 0:
+                if show_hyps:
                     # we print the environment only for the current subgoal
                     for hyp in hyps:
                         lst = map(lambda s: s.encode('utf-8'), hyp.split('\n'))
                         self.goal_buffer.append(list(lst))
+                    show_hyps = False
                 self.goal_buffer.append('')
                 self.goal_buffer.append('======================== ( %d / %d )' % (idx+1 , nb_subgoals))
                 lines = map(lambda s: s.encode('utf-8'), ccl.split('\n'))
