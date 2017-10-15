@@ -8,6 +8,7 @@ import subprocess
 import xml.etree.ElementTree as ET
 import signal
 import sys
+import threading
 
 from collections import deque, namedtuple
 
@@ -179,20 +180,29 @@ def escape(cmd):
         return escaped.encode('ascii', 'xmlcharrefreplace')
 
 class Command(object):
+    # Values for self.state
+    # ----------------------
     # Command was sent to coqtop through an Add call, and coq acknowledged the
     # Add.
     SENT = 0
-    # The worker that was processing this command died before finishing
-    # processing the command. The command will never be finished.
+    # Either the worker that was processing this command died before finishing
+    # processing the command, or coq rejected the Add call. The command will
+    # never be finished.
     ABANDONED = 1
     # coqtop marked the command as processed through a feedback statement.
     PROCESSED = 2
+    REVERTED = 3
+
+    # Values for self.msg_type
+    # ----------------------------
+    # 
+    NONE = 0
     # coqtop sent a warning level message for the command through a feedback
     # statement.
-    WARNING = 3
+    WARNING = 1
     # coqtop sent an error level message for the command through a feedback
     # statement.
-    ERROR = 4
+    ERROR = 2
 
     next_edit = -1
 
@@ -206,6 +216,7 @@ class Command(object):
         # command.
         assert(len(end) == 3)
         self.end = end
+        self.msg_type = self.NONE
         # A byte offset relative to the start of this command where the warning
         # or error starts.
         self.msg_start_offset = None
@@ -220,6 +231,11 @@ class Command(object):
         self.worker = None
 
 class CoqTop(object):
+    # bit fields for self.result
+    COMMAND_CHANGED = 1
+    MESSAGE_RECEIVED = 2
+    SEND_DONE = 4
+
     def __init__(self):
         self.coqtop = None
         self.states = []
@@ -228,21 +244,27 @@ class CoqTop(object):
         # reverted commands. This is important because sometimes coqtop forces
         # the state to get reverted.
         # the states to get reverted.
-        self.reverted_states = []
-        self.error_messages = []
+        self.messages = []
+
+        self.lock = threading.Lock()
+        self.result = 0
+        self.has_result = threading.Condition(self.lock)
+        self.send_thread = None
 
     def kill_coqtop(self):
-        if self.coqtop:
-            try:
-                self.coqtop.terminate()
-                self.coqtop.communicate()
-            except OSError:
-                pass
-            self.coqtop = None
-            self.states = []
-            self.clear_errors()
+        with self.lock:
+            if self.coqtop:
+                try:
+                    self.coqtop.terminate()
+                    self.coqtop.communicate()
+                except OSError:
+                    pass
+                self.coqtop = None
+                self.states = []
+                self.reverted_index = 0
+                self.messages = []
 
-    def get_command(self, state_id):
+    def get_command_by_state_id(self, state_id):
         for s in self.states:
             if s.state_id == state_id:
                  return s
@@ -254,12 +276,37 @@ class CoqTop(object):
                  return s
         return None
 
+    def check_state_indexes(self):
+        assert self.reverted_index <= len(self.states)
+
+    def get_active_command_count(self):
+        with self.lock:
+            self.check_state_indexes()
+            return self.reverted_index
+
+    def get_last_active_command(self):
+        with self.lock:
+            self.check_state_indexes()
+            if self.reverted_index > 0:
+                return self.states[self.reverted_index - 1]
+            else:
+                return None
+
+    def get_active_commands(self):
+        with self.lock:
+            self.check_state_indexes()
+            return list(self.states[0:self.reverted_index])
+
+    def get_commands(self):
+        with self.lock:
+            return list(self.states)
+
     def parse_feedback(self, xml):
         assert xml.tag == 'feedback'
         message = None
         if xml.get("object") == "state":
             state_id = parse_value(xml.find("state_id"))
-            comm = self.get_command(state_id)
+            comm = self.get_command_by_state_id(state_id)
         else:
             edit_id = parse_value(xml.find("edit_id"))
             comm = self.get_command_by_edit(edit_id)
@@ -274,14 +321,20 @@ class CoqTop(object):
             else:
                 level = Command.WARNING
             if comm:
-                comm.state = level
+                comm.msg_type = level
                 # The element type is option
                 if messageNode[1].get("val") == "some":
                     loc = messageNode[1].find("loc")
                     comm.msg_start_offset = int(loc.get("start"))
                     comm.msg_stop_offset = int(loc.get("stop"))
+                # Only transition from SENT to PROCESSED.
+                if comm.state == Command.SENT:
+                    comm.state = Command.PROCESSED
+                self.result |= self.COMMAND_CHANGED
             message = parse_value(messageNode.find("richpp"))
-            self.error_messages.append(message)
+            self.messages.append(message)
+            self.result |= self.MESSAGE_RECEIVED
+            self.has_result.notify()
         elif feedback_type == "processingin":
             if comm is not None:
                 comm.worker = parse_value(feedback_content[0])
@@ -290,22 +343,17 @@ class CoqTop(object):
             if status == "Dead":
                 # The worker died. Mark all commands it was processing as
                 # abandoned.
-                for c in self.states:
+                for c in self.states[0:self.reverted_index]:
                     if c.state == Command.SENT and c.worker == worker:
                         c.state = Command.ABANDONED
+                self.result |= self.COMMAND_CHANGED
+                self.has_result.notify()
         elif feedback_type == "processed":
-            # Only transition from SENT to PROCESSED. coqtop likes to send out
-            # extra feedback messages. Do not let it transition the command
-            # from WARNING to PROCESSED.
-            #
-            # Also note that sometimes coqtop sends processed feedback for
-            # commands that it hasn't sent the Add reply for yet. Its difficult
-            # to process the feedback when the correspondance between the
-            # Command and state_id isn't known yet. So that feedback can be
-            # ignored. coqtop will send another processed feedback after the
-            # Add reply is sent.
+            # Only transition from SENT to PROCESSED.
             if comm and comm.state == Command.SENT:
                 comm.state = Command.PROCESSED
+                self.result |= self.COMMAND_CHANGED
+                self.has_result.notify()
         return message
 
     def parse_message(self, xml):
@@ -313,13 +361,14 @@ class CoqTop(object):
         level = xml.find('message_level')
         if level is not None:
             level = level.get('val')
-        if level == 'warning' and self.states:
-            comm = self.states[-1]
+        self.check_state_indexes()
+        if level == 'warning' and self.reverted_index > 0:
+            comm = self.states[self.reverted_index - 1]
             if comm.state_id is None:
                 # Attach the warning message to the command that is currently being
                 # parsed.
-                comm.state = Command.WARNING
-        self.error_messages.append(parse_value(xml[2]))
+                comm.msg_type = Command.WARNING
+        self.messages.append(parse_value(xml[2]))
 
     def process_response(self):
         fd = self.coqtop.stdout.fileno()
@@ -329,32 +378,33 @@ class CoqTop(object):
                 data += os.read(fd, 0x4000).decode("utf-8")
                 try:
                     elt = ET.fromstring('<coqtoproot>' + escape(data) + '</coqtoproot>')
-                    # The data parsed correctly. Clear it so that it isn't
-                    # parsed again when new data comes in.
-                    data = ''
-                    valueNode = None
-                    messageNode = None
-                    for c in elt:
-                        if c.tag == 'value':
-                            valueNode = c
-                        if c.tag == 'message':
-                            self.parse_message(c)
-                        # Extract messages from feedbacks to handle errors
-                        if c.tag == 'feedback':
-                            messageNode = self.parse_feedback(c)
-                    if valueNode is None:
-                        return None
-                    vp = parse_response(valueNode)
-                    if messageNode is not None:
-                        if isinstance(vp, Ok):
-                            return Ok(vp.val, messageNode)
-                        elif isinstance(vp, Err):
-                            if vp.err not in self.error_messages:
-                                self.error_messages.append(vp.err)
-                            # Override error message : coq provides one
-                            return Err(messageNode, vp.revert_state,
-                                       vp.loc_s, vp.loc_e)
-                    return vp
+                    with self.lock:
+                        # The data parsed correctly. Clear it so that it isn't
+                        # parsed again when new data comes in.
+                        data = ''
+                        valueNode = None
+                        messageNode = None
+                        for c in elt:
+                            if c.tag == 'value':
+                                valueNode = c
+                            if c.tag == 'message':
+                                self.parse_message(c)
+                            # Extract messages from feedbacks to handle errors
+                            if c.tag == 'feedback':
+                                messageNode = self.parse_feedback(c)
+                        if valueNode is None:
+                            return None
+                        vp = parse_response(valueNode)
+                        if messageNode is not None:
+                            if isinstance(vp, Ok):
+                                return Ok(vp.val, messageNode)
+                            elif isinstance(vp, Err):
+                                if vp.err not in self.messages:
+                                    self.messages.append(vp.err)
+                                # Override error message : coq provides one
+                                return Err(messageNode, vp.revert_state,
+                                           vp.loc_s, vp.loc_e)
+                        return vp
                 except ET.ParseError:
                     continue
             except OSError:
@@ -372,9 +422,9 @@ class CoqTop(object):
             if feedback_callback is not None:
                 feedback_callback()
 
-    def call(self, name, arg, encoding='utf-8', feedback_callback=None):
+    def call(self, name, arg, feedback_callback=None):
         xml = encode_call(name, arg)
-        msg = ET.tostring(xml, encoding)
+        msg = ET.tostring(xml, 'utf-8')
         self.send_cmd(msg)
         response = self.get_answer(feedback_callback)
         return response
@@ -393,29 +443,33 @@ class CoqTop(object):
                   , 'on'
                   ]
         try:
-            if os.name == 'nt':
-                self.coqtop = subprocess.Popen(
-                    options + list(args)
-                  , stdin = subprocess.PIPE
-                  , stdout = subprocess.PIPE
-                  , stderr = subprocess.STDOUT
-                )
-            else:
-                self.coqtop = subprocess.Popen(
-                    options + list(args)
-                  , stdin = subprocess.PIPE
-                  , stdout = subprocess.PIPE
-                  , preexec_fn = ignore_sigint
-                )
+            with self.lock:
+                if os.name == 'nt':
+                    self.coqtop = subprocess.Popen(
+                        options + list(args)
+                      , stdin = subprocess.PIPE
+                      , stdout = subprocess.PIPE
+                      , stderr = subprocess.STDOUT
+                    )
+                else:
+                    self.coqtop = subprocess.Popen(
+                        options + list(args)
+                      , stdin = subprocess.PIPE
+                      , stdout = subprocess.PIPE
+                      , preexec_fn = ignore_sigint
+                    )
 
             r = self.call('Init', Option(None))
-            assert isinstance(r, Ok)
-            comm = Command((0, 0, 0))
-            comm.edit_id = None
-            comm.state_id = r.val
-            comm.state = Command.PROCESSED
-            self.states = [comm]
-            return True
+            with self.lock:
+                assert isinstance(r, Ok)
+                comm = Command((0, 0, 0))
+                comm.edit_id = None
+                comm.state_id = r.val
+                comm.state = Command.PROCESSED
+                self.states = [comm]
+                self.reverted_index = len(self.states)
+                self.check_state_indexes()
+                return True
         except OSError as e:
             print("Error: couldn't launch coqtop:", e)
             return False
@@ -424,66 +478,147 @@ class CoqTop(object):
         return self.restart_coq(*args)
 
     def cur_state(self):
-        return self.states[-1].state_id
+        self.check_state_indexes()
+        return self.states[self.reverted_index - 1].state_id
 
-    # Clear the error messages from old commands.
+    # Clear the messages from old commands.
     #
     # The error state and location of non-reverted commands will stay, but
     # their error messages will be reverted.
-    def clear_errors(self):
-        self.reverted_states = []
-        self.error_messages = []
+    def clear_messages(self):
+        with self.lock:
+            self.check_state_indexes()
+            self.messages = []
+            del self.states[self.reverted_index:]
+            self.check_state_indexes()
 
-    def get_errors(self):
-        return "\n".join(self.error_messages)
+    def get_messages(self):
+        with self.lock:
+            return "\n".join(self.messages)
 
-    def advance(self, cmd, end, encoding = 'utf-8'):
-        cur_state = self.cur_state()
-        comm = Command(end)
-        self.states.append(comm)
+    def advance(self, cmd, end):
+        with self.lock:
+            cur_state = self.cur_state()
+            assert self.reverted_index == len(self.states)
+            comm = Command(end)
+            self.states.append(comm)
+            self.reverted_index += 1
         r = self.call('Add', ((cmd, comm.edit_id.id),
-                              (cur_state, True)), encoding)
-        if r is None or isinstance(r, Err):
-            self.states = self.states[:len(self.states)-1]
-            self.reverted_states = [comm] + self.reverted_states
+                              (cur_state, True)))
+        with self.lock:
+            if r is None or isinstance(r, Err):
+                comm.state = Command.ABANDONED
+                if r is not None:
+                    self.messages.append(r.err)
+                    comm.msg_start_offset = int(r.loc_s)
+                    comm.msg_stop_offset = int(r.loc_e)
+                    comm.msg_type = Command.ERROR
+                self.reverted_index -= 1
+                return r
+            comm.state_id = r.val[0]
             return r
-        comm.state_id = r.val[0]
-        return r
 
     def rewind(self, step = 1, keep_states = False):
-        assert step <= len(self.states)
-        # At least one state, the root state, has to remain
-        assert step < len(self.states)
-        idx = len(self.states) - step
-        if keep_states:
-            self.reverted_states = self.states[idx:] + self.reverted_states
-        self.states = self.states[0:idx]
-        return self.call('Edit_at', self.cur_state())
+        with self.lock:
+            # At least one state, the root state, has to remain
+            assert step < self.reverted_index
+            self.check_state_indexes()
+            idx = self.reverted_index - step
+            for c in self.states[idx:]:
+                c.state = Command.REVERTED
+            self.reverted_index = idx
+            if not keep_states:
+                del self.states[self.reverted_index:]
+            self.check_state_indexes()
+            rewind_state = self.cur_state()
+        return self.call('Edit_at', rewind_state)
 
-    def query(self, cmd, encoding = 'utf-8'):
-        r = self.call('Query', (cmd, self.cur_state()), encoding)
+    def query(self, cmd):
+        with self.lock:
+            cur_state = self.cur_state()
+        r = self.call('Query', (cmd, cur_state))
         return r
 
     def has_unchecked_commands(self):
-        return any(c.state == Command.SENT for c in self.states)
+        with self.lock:
+            return any(c.state == Command.SENT for c in self.states[0:self.reverted_index])
 
     def goals(self, feedback_callback):
         vp = self.call('Goal', (), feedback_callback=feedback_callback)
         if isinstance(vp, Ok):
-            return vp
-        if vp.revert_state.id == 0:
-            if vp.err not in self.error_messages:
-                self.error_messages.append(vp.err)
-            # Can't revert to state 0 (which is before the Init)
-            return vp
-        # An error occurred. Revert back to the state coqtop requested, and ask
-        # for the goal again.
-        revert_count = 0
-        while (revert_count < len(self.states) and
-               self.states[-1 - revert_count].state_id.id > vp.revert_state.id):
-            revert_count += 1
-        self.rewind(revert_count, keep_states = True)
-        return self.call('Goal', (), feedback_callback=feedback_callback)
+            return vp.val
+        with self.lock:
+            if vp.revert_state.id == 0:
+                if vp.err not in self.messages:
+                    self.messages.append(vp.err)
+                # Can't revert to state 0 (which is before the Init). So revert
+                # back to the end of the contiguously processed section.
+                revert_to = 1
+                while (revert_to + 1 < self.reverted_index and
+                        self.states[revert_to + 1].state & Command.PROCESSED):
+                    revert_to += 1
+            else:
+                # An error occurred. Revert back to the state coqtop requested, and ask
+                # for the goal again.
+                revert_to = self.reverted_index
+                while (1 < revert_to and
+                       self.states[revert_to - 1].state_id.id > vp.revert_state.id):
+                    revert_to -= 1
+        self.rewind(self.reverted_index - revert_to, keep_states = True)
+        vp = self.call('Goal', (), feedback_callback=feedback_callback)
+        if isinstance(vp, Ok):
+            return vp.val
+        else:
+            if vp.err not in self.messages:
+                self.messages.append(vp.err)
+            return None
 
-    def read_states(self):
-        return self.states
+    def send_async(self, send_queue):
+        """
+        Tries to send every message in [send_queue] to Coq, stops at the first
+        error.
+        """
+        assert self.send_thread == None
+        def process_queue():
+            try:
+                for (message, end) in send_queue:
+                    response = self.advance(message, end)
+                    with self.lock:
+                        self.result |= self.COMMAND_CHANGED
+                        self.has_result.notify()
+
+                        if response is None:
+                            self.messages.append('ERROR: the Coq process died')
+                            self.result |= self.MESSAGE_RECEIVED
+                            self.has_result.notify()
+                            return
+
+                        if not isinstance(response, Ok):
+                            if not isinstance(response, Err):
+                                self.messages.append(
+                                        "(ANOMALY) unknown answer: %s" %
+                                        ET.tostring(response))
+                                self.result |= self.MESSAGE_RECEIVED
+                                self.has_result.notify()
+                            break
+            finally:
+                with self.lock:
+                    self.result |= self.SEND_DONE
+                    self.has_result.notify()
+
+        self.send_thread = threading.Thread(target=process_queue, name="send thread")
+        self.send_thread.start()
+
+    def wait_for_result(self):
+        with self.lock:
+            while self.result == 0:
+                self.has_result.wait()
+            result = self.result
+            self.result = 0
+            return result
+
+    def finish_send(self):
+        with self.lock:
+            thread = self.send_thread
+            self.send_thread = None
+        thread.join()

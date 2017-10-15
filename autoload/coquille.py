@@ -4,7 +4,6 @@ from __future__ import division
 
 import vim
 
-import itertools
 import re
 import xml.etree.ElementTree as ET
 import coqtop as CT
@@ -77,13 +76,6 @@ class BufferState(object):
         self.goal_buffer = None
         #: See vimbufsync ( https://github.com/def-lkb/vimbufsync )
         self.saved_sync = None
-
-        #: Keeps track of what have been checked by Coq, and what is waiting to be
-        #: checked.
-        self.send_queue = deque([])
-
-        self.error_at = None
-
         self.coq_top = CT.CoqTop()
 
     def sync_vars(self):
@@ -111,7 +103,7 @@ class BufferState(object):
     def sync(self):
         curr_sync = vimbufsync.sync(self.source_buffer)
         if not self.saved_sync or curr_sync.buf() != self.saved_sync.buf():
-            if len(self.coq_top.states) > 1:
+            if self.coq_top.get_active_command_count() > 1:
                 self._reset()
         else:
             (line, col) = self.saved_sync.pos()
@@ -121,9 +113,7 @@ class BufferState(object):
 
     def _reset(self):
         self.coq_top.kill_coqtop()
-        self.send_queue = deque([])
         self.saved_sync = None
-        self.error_at   = None
         self.reset_color()
 
     #####################
@@ -136,15 +126,15 @@ class BufferState(object):
         self._reset()
 
     def goto_last_sent_dot(self):
-        (line, col) = ((0,1) if not self.coq_top.states
-                             else self.coq_top.states[-1].end)
+        last = self.coq_top.get_last_active_command()
+        (line, col) = ((0,1) if not last else last.end)
         vim.current.window.cursor = (line + 1, col)
 
     def coq_rewind(self, steps=1):
         self.clear_info()
 
         # Do not allow the root state to be rewound
-        if steps < 1 or len(self.coq_top.states) < 2:
+        if steps < 1 or self.coq_top.get_active_command_count() < 2:
             return
 
         if self.coq_top.coqtop is None:
@@ -175,8 +165,8 @@ class BufferState(object):
 
         (cline, ccol) = vim.current.window.cursor
         cline -= 1
-        last_sent = ((0,0,0) if not self.coq_top.states
-                     else self.coq_top.states[-1].end)
+        last = self.coq_top.get_last_active_command()
+        last_sent = ((0,0,0) if not last else last.end)
         (line, col, byte) = last_sent
 
         if cline < line or (cline == line and ccol < col):
@@ -184,16 +174,17 @@ class BufferState(object):
             # cursor as sent.
             self.rewind_to(cline, ccol + 1)
         else:
+            send_queue = deque([])
             while True:
                 r = self._get_message_range(last_sent)
                 if (r is not None
-                    and (r['stop'][0], r['stop'][1]) <= (cline, ccol + 1)):
-                    last_sent = r['stop']
-                    self.send_queue.append(r)
+                    and (r[1][0], r[1][1]) <= (cline, ccol + 1)):
+                    last_sent = r[1]
+                    send_queue.append(r)
                 else:
                     break
 
-            self.send_until_fail()
+            self.send_until_fail(send_queue)
 
     def coq_next(self):
         if self.coq_top.coqtop is None:
@@ -202,16 +193,16 @@ class BufferState(object):
 
         self.sync()
 
-        last_sent = ((0,0,0) if not self.coq_top.states
-                     else self.coq_top.states[-1].end)
+        last = self.coq_top.get_last_active_command()
+        last_sent = ((0,0,0) if not last else last.end)
         message_range = self._get_message_range(last_sent)
 
         if message_range is None: return
 
-        assert(len(message_range['start']) == 3)
-        self.send_queue.append(message_range)
+        send_queue = deque([])
+        send_queue.append(message_range)
 
-        self.send_until_fail()
+        self.send_until_fail(send_queue)
 
         if (vim.eval('g:coquille_auto_move') == 'true'):
             self.goto_last_sent_dot()
@@ -225,16 +216,14 @@ class BufferState(object):
 
         raw_query = ' '.join(args)
 
-        encoding = vim.eval("&encoding") or 'utf-8'
-
-        response = self.coq_top.query(raw_query, encoding)
+        response = self.coq_top.query(raw_query)
 
         if response is None:
             vim.command("call coquille#KillSession()")
             print('ERROR: the Coq process died')
             return
 
-        info_msg = self.coq_top.get_errors()
+        info_msg = self.coq_top.get_messages()
         self.show_info(info_msg)
 
 
@@ -250,11 +239,11 @@ class BufferState(object):
         return self.coq_top.restart_coq(*args)
 
     def debug(self):
-        if self.coq_top.states:
-            print("encountered dots = [")
-            for (line, col) in self.coq_top.states:
-                print("  (%d, %d) ; " % (line, col))
-            print("]")
+        commands = self.coq_top.get_active_commands()
+        print("encountered dots = [")
+        for (line, col) in commands:
+            print("  (%d, %d) ; " % (line, col))
+        print("]")
 
     #####################################
     # IDE tools: Goal, Infos and colors #
@@ -265,7 +254,7 @@ class BufferState(object):
         def update():
             self.reset_color()
             vim.command('redraw')
-            new_info = self.coq_top.get_errors()
+            new_info = self.coq_top.get_messages()
             if last_info[0] != new_info:
                 self.show_info(new_info)
                 last_info[0] = new_info
@@ -273,34 +262,27 @@ class BufferState(object):
         # trigger it to start processing all the commands that have been added.
         # So show_goal needs to be called before waiting for all the unchecked
         # commands finished.
-        if self.show_goal(update):
+        response = self.coq_top.goals(update)
+        if self.show_goal(response):
             while self.coq_top.has_unchecked_commands():
                 self.coq_top.process_response()
                 update()
         update()
 
-    def show_goal(self, feedback_callback):
+    def show_goal(self, response):
         # Temporarily make the goal buffer modifiable
         modifiable = self.goal_buffer.options["modifiable"]
         self.goal_buffer.options["modifiable"] = True
         try:
             del self.goal_buffer[:]
 
-            response = self.coq_top.goals(feedback_callback)
-
             if response is None:
-                vim.command("call coquille#KillSession()")
-                print('ERROR: the Coq process died')
                 return False
 
-            if isinstance(response, CT.Err):
-                return False
-
-            if response.val.val is None:
+            goals = response.val
+            if goals is None:
                 self.goal_buffer[0] = 'No goals.'
                 return True
-
-            goals = response.val.val
 
             sub_goals = goals.fg
             msg_format = '{0} subgoal{1}'
@@ -368,7 +350,7 @@ class BufferState(object):
             self.info_buffer.options["modifiable"] = modifiable
 
     def clear_info(self):
-        self.coq_top.clear_errors()
+        self.coq_top.clear_messages()
         self.show_info(None)
 
     def convert_offset(self, range_start, offset, range_end):
@@ -385,8 +367,11 @@ class BufferState(object):
         prev_end = None
         sent_start = None
         checked_start = None
-        for c in itertools.chain(self.coq_top.states):
-            if c.state in (CT.Command.SENT, CT.Command.ABANDONED):
+        commands = self.coq_top.get_commands()
+        for c in commands:
+            if c.state in (CT.Command.REVERTED, CT.Command.ABANDONED):
+                break
+            if c.state == CT.Command.SENT:
                 if sent_start is None:
                     # Start a sent range
                     sent_start = prev_end
@@ -395,12 +380,11 @@ class BufferState(object):
                 sent.append(make_vim_range(sent_start, prev_end))
                 sent_start = None
 
-            # Count the warning and error states as checked. A subrange will
-            # also be marked as a warning or error, but that will override the
-            # checked group.
-            if c.state in (CT.Command.PROCESSED, 
-                           CT.Command.WARNING, 
-                           CT.Command.ERROR):
+            # Include all the processed commands as checked, even if they
+            # produced a warning or error message. A subrange will also be
+            # marked as a warning or error, but that will override the checked
+            # group.
+            if c.state == CT.Command.PROCESSED:
                 if checked_start is None:
                     # Start a checked range
                     checked_start = prev_end
@@ -416,10 +400,8 @@ class BufferState(object):
             # Finish a checked range
             checked.append(make_vim_range(checked_start, prev_end))
         prev_end = None
-        for c in itertools.chain(self.coq_top.states,
-                                 self.coq_top.reverted_states):
-            if c.state in (CT.Command.WARNING, 
-                           CT.Command.ERROR):
+        for c in commands:
+            if c.msg_type != CT.Command.NONE:
                 # Normalize the start and stop positions, if it hasn't been done yet.
                 if c.msg_start_offset is not None and c.msg_start is None:
                     c.msg_start = self.convert_offset(prev_end,
@@ -434,7 +416,7 @@ class BufferState(object):
                 if start == stop:
                     start = prev_end
                     stop = c.end
-                if c.state == CT.Command.WARNING:
+                if c.msg_type == CT.Command.WARNING:
                     warnings.append(make_vim_range(start, stop))
                 else:
                     errors.append(make_vim_range(start, stop))
@@ -458,17 +440,17 @@ class BufferState(object):
             print('Please report.')
             return
 
-        if (self.coq_top.states and
-            (self.coq_top.states[-1].end[0],
-             self.coq_top.states[-1].end[1]) <= (line, col)):
+        last = self.coq_top.get_last_active_command()
+        if (last and (last.end[0], last.end[1]) <= (line, col)):
             # The caller asked to rewind to a position after what has been
             # processed. This quick path exits without having to search the
             # state list.
             return
 
         predicate = lambda x: (x.end[0], x.end[1]) <= (line, col)
-        lst = filter(predicate, self.coq_top.states)
-        steps = len(self.coq_top.states) - len(list(lst))
+        commands = self.coq_top.get_active_commands()
+        lst = filter(predicate, commands)
+        steps = len(commands) - len(list(lst))
         if steps != 0:
             self.coq_rewind(steps)
 
@@ -476,7 +458,7 @@ class BufferState(object):
     # Communication with Coqtop #
     #############################
 
-    def send_until_fail(self):
+    def send_until_fail(self, send_queue):
         """
         Tries to send every message in [send_queue] to Coq, stops at the first
         error.
@@ -484,46 +466,22 @@ class BufferState(object):
         """
         self.clear_info()
 
-        encoding = vim.eval('&fileencoding') or 'utf-8'
-
-        while len(self.send_queue) > 0:
-            message_range = self.send_queue.popleft()
-            (eline, ecol, ebyte) = message_range['stop']
-            message = self._between(message_range['start'],
-                                    (eline, ecol - 1, ebyte - 1))
-
-            response = self.coq_top.advance(message,
-                                            (eline, ecol, ebyte), encoding)
-
-            if response is None:
-                vim.command("call coquille#KillSession()")
-                print('ERROR: the Coq process died')
-                return
-
-            if isinstance(response, CT.Ok):
-                optionnal_info = response.val[1]
-            else:
-                self.send_queue.clear()
-                if isinstance(response, CT.Err):
-                    loc_s = response.loc_s
-                    if loc_s is not None:
-                        loc_e = response.loc_e
-                        (l, c, b) = message_range['start']
-                        (l_start, c_start, b_start) = _pos_from_offset(c, b,
-                                                                       message,
-                                                                       loc_s)
-                        (l_stop, c_stop, b_stop)    = _pos_from_offset(c, b,
-                                                                       message,
-                                                                       loc_e)
-                        self.error_at = ((l + l_start, c_start, b_start),
-                                         (l + l_stop, c_stop, b_stop))
-                else:
-                    print("(ANOMALY) unknown answer: %s" % ET.tostring(response))
-                break
+        # Start sending on a background thread
+        self.coq_top.send_async(send_queue)
             
-            self.reset_color()
-            vim.command('redraw')
+        # Redraw the screen when the background thread makes progress
+        while True:
+            result = self.coq_top.wait_for_result()
+            if result & CT.CoqTop.COMMAND_CHANGED:
+                self.reset_color()
+                vim.command('redraw')
+            if result & CT.CoqTop.MESSAGE_RECEIVED:
+                new_info = self.coq_top.get_messages()
+                self.show_info(new_info)
+            if result & CT.CoqTop.SEND_DONE:
+                break
 
+        self.coq_top.finish_send()
         self.refresh()
 
     #################
@@ -573,7 +531,11 @@ class BufferState(object):
         if end_pos is None:
             return None
         else:
-            return { 'start':after , 'stop':self._add_byte_offset(end_pos) }
+            end_pos = self._add_byte_offset(end_pos)
+            (eline, ecol, ebyte) = end_pos
+            message = self._between(after,
+                                    (eline, ecol - 1, ebyte - 1))
+            return (message, end_pos)
 
     # A bullet is:
     # - One or more '-'
