@@ -307,6 +307,10 @@ class CoqTop(object):
         if xml.get("object") == "state":
             state_id = parse_value(xml.find("state_id"))
             comm = self.get_command_by_state_id(state_id)
+            if comm is None:
+                # coqtop must be sending feedback for a statement before it
+                # sent a reply to the Add command.
+                comm = self.get_command_by_state_id(None)
         else:
             edit_id = parse_value(xml.find("edit_id"))
             comm = self.get_command_by_edit(edit_id)
@@ -318,9 +322,11 @@ class CoqTop(object):
             level = level.get("val")
             if level == "error":
                 level = Command.ERROR
-            else:
+            elif level == "warning":
                 level = Command.WARNING
-            if comm:
+            else:
+                level = Command.NONE
+            if comm and level != Command.NONE:
                 comm.msg_type = level
                 # The element type is option
                 if messageNode[1].get("val") == "some":
