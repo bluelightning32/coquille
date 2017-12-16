@@ -682,6 +682,36 @@ endfunction
 
 let s:empty_range = [ { 'line': 0, 'col': 0}, { 'line': 0, 'col': 0} ]
 
+function! coquille#FixWindowScroll(winid, hint_tabnr, hint_winnr)
+    let l:cur_tab = tabpagenr()
+    let l:cur_win = winnr()
+    let l:tabwin = coquille#WinId2TabWin(a:winid, a:hint_tabnr, a:hint_winnr)
+    if l:tabwin[0] != l:cur_tab
+        " Only fix the scroll for windows in the current tab. The other
+        " windows will be fixed when their tab is entered.
+        return 0
+    endif
+
+    if coquille#GetWinVar(a:winid, l:tabwin[0], l:tabwin[1],
+                \         "coquille_needs_scroll_fix", 0)
+        let l:cur_winid = coquille#WinGetId(l:cur_tab, l:cur_win)
+        call coquille#SetWinVar(a:winid, l:tabwin[0], l:tabwin[1],
+                    \           "coquille_needs_scroll_fix", 0)
+        " When the cursor is at the last line of the buffer, then the number
+        " of lines in the buffer is reduced from python, vim leaves the window
+        " scrolled past the end. Just entering the window is enough to fix it.
+        call coquille#WinGoToId(a:winid, l:tabwin[0], l:tabwin[1])
+
+        call coquille#WinGoToId(l:cur_winid, l:cur_tab, l:cur_win)
+        return 1
+    endif
+endfunction
+
+function! coquille#FixWindowScrollTabWin(tabnr, winnr)
+    let l:winid = coquille#WinGetId(a:tabnr, a:winnr)
+    return coquille#FixWindowScroll(l:winid, a:tabnr, a:winnr)
+endfunction
+
 function! coquille#SyncWindowColors(winid, hint_tabnr, hint_winnr)
     let l:cur_tab = tabpagenr()
     let l:cur_win = winnr()
@@ -772,8 +802,10 @@ function! coquille#TabActivated()
     while l:cur_win <= tabpagewinnr(l:cur_tab, "$")
         let l:cur_winid = coquille#WinGetId(l:cur_tab, l:cur_win)
         call coquille#SyncWindowColors(l:cur_winid, l:cur_tab, l:cur_win)
+        call coquille#FixWindowScroll(l:cur_winid, l:cur_tab, l:cur_win)
         let l:cur_win += 1
     endwhile
+
 endfunction
 
 function! coquille#WindowActivated(winid, hint_tabnr, hint_winnr)

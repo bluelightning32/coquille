@@ -49,6 +49,27 @@ def vim_repr(value):
 def make_vim_range(start, stop):
     return [[start[0] + 1, start[2] + 1], [stop[0] + 1, stop[2] + 1]]
 
+# Return a list of all windows that are displaying the buffer, along with their
+# current cursor positions.
+def get_cursors_for_buffer(vim_buffer):
+    result = []
+    for win in vim.windows:
+        if win.buffer is vim_buffer:
+            result.append((win, win.cursor))
+    return result
+
+# Takes the list of window cursor positions from get_cursor_for_buffer. If the
+# cursor position is now lower for any of the windows, they are entered to
+# rescroll the window.
+def fix_scroll(cursors):
+    refresh_now = None
+    for win, (row, col) in cursors:
+        if win.cursor[0] < row or win.cursor[1] < col:
+            win.vars['coquille_needs_scroll_fix'] = 1
+            if win.tabpage is vim.current.tabpage:
+                vim.command("call coquille#FixWindowScrollTabWin(%d, %d)" %
+                    (win.tabpage.number, win.number))
+
 # All the python side state associated with the vim source buffer
 class BufferState(object):
     # Dict mapping source buffer id to BufferState
@@ -274,6 +295,7 @@ class BufferState(object):
         modifiable = self.goal_buffer.options["modifiable"]
         self.goal_buffer.options["modifiable"] = True
         try:
+            cursors = get_cursors_for_buffer(self.goal_buffer)
             del self.goal_buffer[:]
 
             if response is None:
@@ -320,6 +342,8 @@ class BufferState(object):
                 lines = map(lambda s: s.encode('utf-8'), ccl.split('\n'))
                 self.goal_buffer.append(list(lines))
                 self.goal_buffer.append('')
+
+            fix_scroll(cursors)
         finally:
             self.goal_buffer.options["modifiable"] = modifiable
         return True
@@ -329,6 +353,7 @@ class BufferState(object):
         modifiable = self.info_buffer.options["modifiable"]
         self.info_buffer.options["modifiable"] = True
         try:
+            cursors = get_cursors_for_buffer(self.info_buffer)
             del self.info_buffer[:]
             lst = []
             if message is not None:
@@ -346,6 +371,7 @@ class BufferState(object):
                 # extend function, and its append mostly behaves like extend.
                 self.info_buffer[0] = lst[0]
                 self.info_buffer.append(lst[1:])
+            fix_scroll(cursors)
         finally:
             self.info_buffer.options["modifiable"] = modifiable
 
