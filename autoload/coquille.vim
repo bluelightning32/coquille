@@ -280,9 +280,9 @@ function! coquille#WinId2TabWin(winid, hint_tabnr, hint_winnr)
         endif
         return [l:tabnr, l:winnr]
     endif
-    let l:search_tab=1
+    let l:search_tab = 1
     while l:search_tab <= tabpagenr("$")
-        let l:search_win=1
+        let l:search_win = 1
         while l:search_win <= tabpagewinnr(l:search_tab, "$")
             if gettabwinvar(l:search_tab, l:search_win, "coquille_winid", -1)
                         \ == a:winid
@@ -422,7 +422,7 @@ endfunction
 " Return the window id of a window in the specified tab with the specified
 " filetype, with w:coquille_shared set to 1, or -1 if no such window exists
 function! coquille#FindSharedWin(tabnr, filetype)
-    let l:search_win=1
+    let l:search_win = 1
     let l:default_shared = !exists("g:coquille_shared") || g:coquille_shared
     while l:search_win <= tabpagewinnr(a:tabnr, "$")
         if !gettabwinvar(a:tabnr, l:search_win, "coquille_shared",
@@ -472,7 +472,7 @@ function coquille#GarbageCollectSupportWin(winid)
         call coquille#LoadBlankBuffer(a:winid, l:tabwin[0], l:tabwin[1])
         return
     endif
-    let l:search_win=1
+    let l:search_win = 1
     while l:search_win <= tabpagewinnr(l:tabwin[0], "$")
         if gettabwinvar(l:tabwin[0], l:search_win, "coquille_goal_winid", -1)
                     \ == a:winid ||
@@ -683,7 +683,14 @@ endfunction
 let s:empty_range = [ { 'line': 0, 'col': 0}, { 'line': 0, 'col': 0} ]
 
 function! coquille#SyncWindowColors(winid, hint_tabnr, hint_winnr)
+    let l:cur_tab = tabpagenr()
+    let l:cur_win = winnr()
     let l:tabwin = coquille#WinId2TabWin(a:winid, a:hint_tabnr, a:hint_winnr)
+    if l:tabwin[0] != l:cur_tab
+        " Only update the colors for windows in the current tab. The colors
+        " for windows in other tabs will be updated when their tab is entered.
+        return 0
+    endif
     let l:bufnr = coquille#TabWinBufnr(l:tabwin[0], l:tabwin[1])
     " Map from variable name to [group name, priority]
     let l:group_infos = {
@@ -704,10 +711,17 @@ function! coquille#SyncWindowColors(winid, hint_tabnr, hint_winnr)
         endif
         " matchadd() only works for the current window. So switch to a:winid.
         if !l:switched
-            let l:cur_tab = tabpagenr()
-            let l:cur_win = winnr()
             let l:cur_winid = coquille#WinGetId(l:cur_tab, l:cur_win)
             call coquille#WinGoToId(a:winid, l:tabwin[0], l:tabwin[1])
+            let l:switched = 1
+        endif
+        " Switching the window could have triggered the colors to get synced.
+        " So double check that they need to be synced.
+        let l:win_value = coquille#GetWinVar(a:winid, tabpagenr(), winnr(),
+                    \                        l:group, [s:empty_range, -1])
+        if l:win_value[0] == l:buf_value
+            " It already matches; nothing to do
+            continue
         endif
         if l:win_value[1] != -1
             call matchdelete(l:win_value[1])
@@ -724,15 +738,42 @@ function! coquille#SyncWindowColors(winid, hint_tabnr, hint_winnr)
                     \           l:group, [l:buf_value, l:matchid])
     endfor
     if l:switched
-        " Switch back to the original tab
+        " Switch back to the original window
         call coquille#WinGoToId(l:cur_winid, l:cur_tab, l:cur_win)
     endif
+    return l:switched
 endfunction
 
 function! coquille#SyncBufferColors(bufid)
+    let l:old_redraw = &lazyredraw
+    if !l:old_redraw
+        "set lazyredraw
+    endif
+    let l:need_redraw = 0
     for winid in coquille#WinFindBuf(a:bufid)
-        call coquille#SyncWindowColors(l:winid, 0, 0)
+        if coquille#SyncWindowColors(l:winid, 0, 0)
+            let l:need_redraw = 1
+        endif
     endfor
+    if !l:old_redraw
+        "set nolazyredraw
+        if l:need_redraw
+            "redraw
+        endif
+    endif
+endfunction
+
+function! coquille#TabActivated()
+    " Colors are not synced for windows in inactive tabs, so when a tab
+    " becomes active, all of its colors need to be synced
+    let l:search_win = 1
+    let l:cur_tab = tabpagenr()
+    let l:cur_win = 1
+    while l:cur_win <= tabpagewinnr(l:cur_tab, "$")
+        let l:cur_winid = coquille#WinGetId(l:cur_tab, l:cur_win)
+        call coquille#SyncWindowColors(l:cur_winid, l:cur_tab, l:cur_win)
+        let l:cur_win += 1
+    endwhile
 endfunction
 
 function! coquille#WindowActivated(winid, hint_tabnr, hint_winnr)
@@ -857,6 +898,7 @@ function! coquille#Register()
         autocmd WinEnter * call coquille#WindowActivated(
                     \ coquille#WinGetId(tabpagenr(), winnr()),
                     \ tabpagenr(), winnr())
+        autocmd TabEnter * call coquille#TabActivated()
         autocmd BufWinEnter * call coquille#WindowActivated(
                     \ coquille#WinGetId(tabpagenr(), winnr()),
                     \ tabpagenr(), winnr())
